@@ -19,20 +19,26 @@ type Server struct {
 
 	mu      sync.Mutex
 	clients map[net.Conn]*ClientState
+
+	shutdownCh chan struct{}
+	shutdown   bool
 }
 
 // ClientState tracks per-client state
 type ClientState struct {
 	session   *session.Session
+	outputCh  chan []byte
 	stopCh    chan struct{}
 	prefixKey bool
+	writeMu   sync.Mutex // protects conn writes
 }
 
 // New creates a new server
 func New() *Server {
 	return &Server{
-		manager: session.NewManager(),
-		clients: make(map[net.Conn]*ClientState),
+		manager:    session.NewManager(),
+		clients:    make(map[net.Conn]*ClientState),
+		shutdownCh: make(chan struct{}),
 	}
 }
 
@@ -59,12 +65,45 @@ func (s *Server) Start() error {
 
 	fmt.Printf("Server listening on %s\n", s.socketPath)
 
+	// Handle shutdown in separate goroutine
+	go func() {
+		<-s.shutdownCh
+		s.listener.Close()
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			s.mu.Lock()
+			isShutdown := s.shutdown
+			s.mu.Unlock()
+			if isShutdown {
+				fmt.Println("Server shutting down...")
+				os.Remove(s.socketPath)
+				return nil
+			}
 			return err
 		}
 		go s.handleClient(conn)
+	}
+}
+
+// Shutdown gracefully shuts down the server
+func (s *Server) Shutdown() {
+	s.mu.Lock()
+	if s.shutdown {
+		s.mu.Unlock()
+		return
+	}
+	s.shutdown = true
+	s.mu.Unlock()
+	close(s.shutdownCh)
+}
+
+// checkAutoShutdown checks if all sessions are gone and shuts down if so
+func (s *Server) checkAutoShutdown() {
+	if s.manager.Count() == 0 {
+		s.Shutdown()
 	}
 }
 
@@ -81,9 +120,22 @@ func (s *Server) handleClient(conn net.Conn) {
 
 		if err := s.handleMessage(conn, msg); err != nil {
 			errMsg := protocol.NewMessage(protocol.MsgError, []byte(err.Error()))
-			protocol.Write(conn, errMsg)
+			s.writeToConn(conn, errMsg)
 		}
 	}
+}
+
+// writeToConn safely writes to a connection using the client's write lock if available
+func (s *Server) writeToConn(conn net.Conn, msg *protocol.Message) error {
+	s.mu.Lock()
+	state := s.clients[conn]
+	s.mu.Unlock()
+
+	if state != nil {
+		state.writeMu.Lock()
+		defer state.writeMu.Unlock()
+	}
+	return protocol.Write(conn, msg)
 }
 
 // handleMessage processes a single message
@@ -125,10 +177,14 @@ func (s *Server) handleNewSession(conn net.Conn, msg *protocol.Message) error {
 		return err
 	}
 
-	s.attachSession(conn, sess)
-
+	// Send success response BEFORE starting goroutines
 	resp := protocol.NewMessage(protocol.MsgSuccess, []byte(name))
-	return protocol.Write(conn, resp)
+	if err := protocol.Write(conn, resp); err != nil {
+		return err
+	}
+
+	s.attachSession(conn, sess)
+	return nil
 }
 
 func (s *Server) handleAttachSession(conn net.Conn, msg *protocol.Message) error {
@@ -139,18 +195,26 @@ func (s *Server) handleAttachSession(conn net.Conn, msg *protocol.Message) error
 		return err
 	}
 
-	s.attachSession(conn, sess)
-
+	// Send success response BEFORE starting goroutines
 	resp := protocol.NewMessage(protocol.MsgSuccess, []byte(name))
-	return protocol.Write(conn, resp)
+	if err := protocol.Write(conn, resp); err != nil {
+		return err
+	}
+
+	s.attachSession(conn, sess)
+	return nil
 }
 
 func (s *Server) attachSession(conn net.Conn, sess *session.Session) {
 	s.detachClient(conn)
 
+	// Subscribe to session output
+	outputCh := sess.Subscribe()
+
 	state := &ClientState{
-		session: sess,
-		stopCh:  make(chan struct{}),
+		session:  sess,
+		outputCh: outputCh,
+		stopCh:   make(chan struct{}),
 	}
 
 	s.mu.Lock()
@@ -165,12 +229,37 @@ func (s *Server) attachSession(conn net.Conn, sess *session.Session) {
 			select {
 			case <-state.stopCh:
 				return
-			case data, ok := <-sess.Output():
+			case data, ok := <-outputCh:
 				if !ok {
 					return
 				}
 				msg := protocol.NewMessage(protocol.MsgOutput, data)
-				if err := protocol.Write(conn, msg); err != nil {
+				state.writeMu.Lock()
+				err := protocol.Write(conn, msg)
+				state.writeMu.Unlock()
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	// Monitor window exits
+	go func() {
+		for {
+			select {
+			case <-state.stopCh:
+				return
+			case <-sess.WindowExitCh():
+				// Check if all windows are closed
+				if sess.WindowCount() == 0 {
+					s.manager.Kill(sess.Name)
+					s.checkAutoShutdown()
+					s.detachClient(conn)
+					resp := protocol.NewMessage(protocol.MsgDetachSession, nil)
+					state.writeMu.Lock()
+					protocol.Write(conn, resp)
+					state.writeMu.Unlock()
 					return
 				}
 			}
@@ -190,6 +279,9 @@ func (s *Server) detachClient(conn net.Conn) {
 		close(state.stopCh)
 		if state.session != nil {
 			state.session.Detach()
+			if state.outputCh != nil {
+				state.session.Unsubscribe(state.outputCh)
+			}
 		}
 	}
 }
@@ -218,7 +310,11 @@ func (s *Server) handleListSessions(conn net.Conn) error {
 
 func (s *Server) handleKillSession(msg *protocol.Message) error {
 	name := string(msg.Payload)
-	return s.manager.Kill(name)
+	err := s.manager.Kill(name)
+	if err == nil {
+		s.checkAutoShutdown()
+	}
+	return err
 }
 
 func (s *Server) handleInput(conn net.Conn, msg *protocol.Message) error {
@@ -256,17 +352,22 @@ func (s *Server) handleInput(conn net.Conn, msg *protocol.Message) error {
 				state.session.PrevWindow()
 				continue
 			case 'd': // Detach
-				s.detachClient(conn)
 				resp := protocol.NewMessage(protocol.MsgDetachSession, nil)
+				state.writeMu.Lock()
 				protocol.Write(conn, resp)
+				state.writeMu.Unlock()
+				s.detachClient(conn)
 				return nil
 			case '&': // Kill window
 				state.session.KillWindow()
 				if state.session.WindowCount() == 0 {
 					s.manager.Kill(state.session.Name)
-					s.detachClient(conn)
+					s.checkAutoShutdown()
 					resp := protocol.NewMessage(protocol.MsgDetachSession, nil)
+					state.writeMu.Lock()
 					protocol.Write(conn, resp)
+					state.writeMu.Unlock()
+					s.detachClient(conn)
 					return nil
 				}
 				continue
@@ -333,7 +434,7 @@ func (s *Server) handleNewWindow(conn net.Conn) error {
 	}
 
 	resp := protocol.NewMessage(protocol.MsgSuccess, nil)
-	return protocol.Write(conn, resp)
+	return s.writeToConn(conn, resp)
 }
 
 func (s *Server) handleSelectWindow(conn net.Conn, msg *protocol.Message) error {
@@ -369,11 +470,15 @@ func (s *Server) handleKillWindow(conn net.Conn) error {
 	// If no more windows, kill the session
 	if state.session.WindowCount() == 0 {
 		s.manager.Kill(state.session.Name)
-		s.detachClient(conn)
+		s.checkAutoShutdown()
 		resp := protocol.NewMessage(protocol.MsgDetachSession, nil)
-		return protocol.Write(conn, resp)
+		state.writeMu.Lock()
+		protocol.Write(conn, resp)
+		state.writeMu.Unlock()
+		s.detachClient(conn)
+		return nil
 	}
 
 	resp := protocol.NewMessage(protocol.MsgSuccess, nil)
-	return protocol.Write(conn, resp)
+	return s.writeToConn(conn, resp)
 }
