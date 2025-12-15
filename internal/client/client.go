@@ -117,6 +117,9 @@ func (c *Client) attachLoop() error {
 	// Send initial size
 	c.sendSize()
 
+	// Ignore SIGINT and SIGQUIT so Ctrl+C and Ctrl+\ are passed through to PTY
+	signal.Ignore(syscall.SIGINT, syscall.SIGQUIT)
+
 	// Handle window resize
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)
