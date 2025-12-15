@@ -89,8 +89,9 @@ var newCmd = &cobra.Command{
 }
 
 var attachCmd = &cobra.Command{
-	Use:   "attach",
-	Short: "Attach to an existing session",
+	Use:     "attach",
+	Aliases: []string{"a"},
+	Short:   "Attach to an existing session",
 	Run: func(cmd *cobra.Command, args []string) {
 		name, _ := cmd.Flags().GetString("target")
 		if name == "" {
